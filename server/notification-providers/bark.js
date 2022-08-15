@@ -12,9 +12,7 @@ const { default: axios } = require("axios");
 
 // bark is an APN bridge that sends notifications to Apple devices.
 
-const barkNotificationGroup = "UptimeKuma";
 const barkNotificationAvatar = "https://github.com/louislam/uptime-kuma/raw/master/public/icon.png";
-const barkNotificationSound = "telegraph";
 const successMessage = "Successes!";
 
 class Bark extends NotificationProvider {
@@ -44,18 +42,37 @@ class Bark extends NotificationProvider {
         }
     }
 
-    // add additional parameter for better on device styles (iOS 15 optimized)
-    appendAdditionalParameters(postUrl) {
-        // grouping all our notifications
-        postUrl += "?group=" + barkNotificationGroup;
+    /**
+     * Add additional parameter for better on device styles (iOS 15
+     * optimized)
+     * @param {string} postUrl URL to append parameters to
+     * @returns {string}
+     */
+    appendAdditionalParameters(notification, postUrl) {
         // set icon to uptime kuma icon, 11kb should be fine
         postUrl += "&icon=" + barkNotificationAvatar;
+        // grouping all our notifications
+        if (notification.barkGroup != null) {
+            postUrl += "&group=" + notification.barkGroup;
+        } else {
+            // default name
+            postUrl += "&group=" + "UptimeKuma";
+        }
         // picked a sound, this should follow system's mute status when arrival
-        postUrl += "&sound=" + barkNotificationSound;
+        if (notification.barkSound != null) {
+            postUrl += "&sound=" + notification.barkSound;
+        } else {
+            // default sound
+            postUrl += "&sound=" + "telegraph";
+        }
         return postUrl;
     }
 
-    // thrown if failed to check result, result code should be in range 2xx
+    /**
+     * Check if result is successful
+     * @param {Object} result Axios response object
+     * @throws {Error} The status code is not in range 2xx
+     */
     checkResult(result) {
         if (result.status == null) {
             throw new Error("Bark notification failed with invalid response!");
@@ -65,6 +82,13 @@ class Bark extends NotificationProvider {
         }
     }
 
+    /**
+     * Send the message
+     * @param {string} title Message title
+     * @param {string} subtitle Message
+     * @param {string} endpoint Endpoint to send request to
+     * @returns {string}
+     */
     async postNotification(title, subtitle, endpoint) {
         // url encode title and subtitle
         title = encodeURIComponent(title);

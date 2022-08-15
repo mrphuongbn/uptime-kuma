@@ -6,15 +6,28 @@ const io = UptimeKumaServer.getInstance().io;
 const prefix = "cloudflared_";
 const cloudflared = new CloudflaredTunnel();
 
+/**
+ * Change running state
+ * @param {string} running Is it running?
+ * @param {string} message Message to pass
+ */
 cloudflared.change = (running, message) => {
     io.to("cloudflared").emit(prefix + "running", running);
     io.to("cloudflared").emit(prefix + "message", message);
 };
 
+/**
+ * Emit an error message
+ * @param {string} errorMessage
+ */
 cloudflared.error = (errorMessage) => {
     io.to("cloudflared").emit(prefix + "errorMessage", errorMessage);
 };
 
+/**
+ * Handler for cloudflared
+ * @param {Socket} socket Socket.io instance
+ */
 module.exports.cloudflaredSocketHandler = (socket) => {
 
     socket.on(prefix + "join", async () => {
@@ -50,7 +63,10 @@ module.exports.cloudflaredSocketHandler = (socket) => {
     socket.on(prefix + "stop", async (currentPassword, callback) => {
         try {
             checkLogin(socket);
-            await doubleCheckPassword(socket, currentPassword);
+            const disabledAuth = await setting("disableAuth");
+            if (!disabledAuth) {
+                await doubleCheckPassword(socket, currentPassword);
+            }
             cloudflared.stop();
         } catch (error) {
             callback({
@@ -69,6 +85,10 @@ module.exports.cloudflaredSocketHandler = (socket) => {
 
 };
 
+/**
+ * Automatically start cloudflared
+ * @param {string} token Cloudflared tunnel token
+ */
 module.exports.autoStart = async (token) => {
     if (!token) {
         token = await setting("cloudflaredTunnelToken");
@@ -85,6 +105,7 @@ module.exports.autoStart = async (token) => {
     }
 };
 
+/** Stop cloudflared */
 module.exports.stop = async () => {
     console.log("Stop cloudflared");
     if (cloudflared) {

@@ -16,7 +16,7 @@ if (nodeVersion < requiredVersion) {
 }
 
 const args = require("args-parser")(process.argv);
-const { sleep, log, getRandomInt, genSecret, debug, isDev } = require("../src/util");
+const { sleep, log, getRandomInt, genSecret, isDev } = require("../src/util");
 const config = require("./config");
 
 log.info("server", "Welcome to Uptime Kuma");
@@ -35,6 +35,7 @@ const fs = require("fs");
 log.info("server", "Importing 3rd-party libraries");
 log.debug("server", "Importing express");
 const express = require("express");
+const expressStaticGzip = require("express-static-gzip");
 log.debug("server", "Importing redbean-node");
 const { R } = require("redbean-node");
 log.debug("server", "Importing jsonwebtoken");
@@ -60,7 +61,7 @@ log.info("server", "Importing this project modules");
 log.debug("server", "Importing Monitor");
 const Monitor = require("./model/monitor");
 log.debug("server", "Importing Settings");
-const { getSettings, setSettings, setting, initJWTSecret, checkLogin, startUnitTest, FBSD, errorLog, doubleCheckPassword } = require("./util-server");
+const { getSettings, setSettings, setting, initJWTSecret, checkLogin, startUnitTest, FBSD, doubleCheckPassword } = require("./util-server");
 
 log.debug("server", "Importing Notification");
 const { Notification } = require("./notification");
@@ -117,13 +118,14 @@ if (config.demoMode) {
 }
 
 // Must be after io instantiation
-const { sendNotificationList, sendHeartbeatList, sendImportantHeartbeatList, sendInfo, sendProxyList } = require("./client");
+const { sendNotificationList, sendHeartbeatList, sendImportantHeartbeatList, sendInfo, sendProxyList, sendDockerHostList } = require("./client");
 const { statusPageSocketHandler } = require("./socket-handlers/status-page-socket-handler");
 const databaseSocketHandler = require("./socket-handlers/database-socket-handler");
 const TwoFA = require("./2fa");
 const StatusPage = require("./model/status_page");
 const { cloudflaredSocketHandler, autoStart: cloudflaredAutoStart, stop: cloudflaredStop } = require("./socket-handlers/cloudflared-socket-handler");
 const { proxySocketHandler } = require("./socket-handlers/proxy-socket-handler");
+const { dockerSocketHandler } = require("./socket-handlers/docker-socket-handler");
 
 app.use(express.json());
 
@@ -137,13 +139,6 @@ app.use(function (req, res, next) {
 });
 
 /**
- * Total WebSocket client connected to server currently, no actual use
- *
- * @type {number}
- */
-let totalClient = 0;
-
-/**
  * Use for decode the auth object
  * @type {null}
  */
@@ -154,22 +149,6 @@ let jwtSecret = null;
  * @type {boolean}
  */
 let needSetup = false;
-
-/**
- * Cache Index HTML
- * @type {string}
- */
-let indexHTML = "";
-
-try {
-    indexHTML = fs.readFileSync("./dist/index.html").toString();
-} catch (e) {
-    // "dist/index.html" is not necessary for development
-    if (process.env.NODE_ENV !== "development") {
-        log.error("server", "Error: Cannot find 'dist/index.html', did you install correctly?");
-        process.exit(1);
-    }
-}
 
 (async () => {
     Database.init(args);
@@ -186,13 +165,25 @@ try {
 
     // Entry Page
     app.get("/", async (request, response) => {
-        debug(`Request Domain: ${request.hostname}`);
+        let hostname = request.hostname;
+        if (await setting("trustProxy")) {
+            const proxy = request.headers["x-forwarded-host"];
+            if (proxy) {
+                hostname = proxy;
+            }
+        }
 
-        if (request.hostname in StatusPage.domainMappingList) {
-            debug("This is a status page domain");
-            response.send(indexHTML);
+        log.debug("entry", `Request Domain: ${hostname}`);
+
+        if (hostname in StatusPage.domainMappingList) {
+            log.debug("entry", "This is a status page domain");
+
+            let slug = StatusPage.domainMappingList[hostname];
+            await StatusPage.handleStatusPageResponse(response, server.indexHTML, slug);
+
         } else if (exports.entryPage && exports.entryPage.startsWith("statusPage-")) {
             response.redirect("/status/" + exports.entryPage.replace("statusPage-", ""));
+
         } else {
             response.redirect("/dashboard");
         }
@@ -221,7 +212,9 @@ try {
     // With Basic Auth using the first user's username/password
     app.get("/metrics", basicAuth, prometheusAPIMetrics());
 
-    app.use("/", express.static("dist"));
+    app.use("/", expressStaticGzip("dist", {
+        enableBrotli: true,
+    }));
 
     // ./data/upload
     app.use("/upload", express.static(Database.uploadDir));
@@ -234,12 +227,16 @@ try {
     const apiRouter = require("./routers/api-router");
     app.use(apiRouter);
 
+    // Status Page Router
+    const statusPageRouter = require("./routers/status-page-router");
+    app.use(statusPageRouter);
+
     // Universal Route Handler, must be at the end of all express routes.
     app.get("*", async (_request, response) => {
         if (_request.originalUrl.startsWith("/upload/")) {
             response.status(404).send("File not found.");
         } else {
-            response.send(indexHTML);
+            response.send(server.indexHTML);
         }
     });
 
@@ -248,23 +245,19 @@ try {
 
         sendInfo(socket);
 
-        totalClient++;
-
         if (needSetup) {
             log.info("server", "Redirect to setup page");
             socket.emit("setup");
         }
-
-        socket.on("disconnect", () => {
-            totalClient--;
-        });
 
         // ***************************
         // Public Socket API
         // ***************************
 
         socket.on("loginByToken", async (token, callback) => {
-            log.info("auth", `Login by token. IP=${getClientIp(socket)}`);
+            const clientIP = await server.getClientIP(socket);
+
+            log.info("auth", `Login by token. IP=${clientIP}`);
 
             try {
                 let decoded = jwt.verify(token, jwtSecret);
@@ -280,14 +273,14 @@ try {
                     afterLogin(socket, user);
                     log.debug("auth", "afterLogin ok");
 
-                    log.info("auth", `Successfully logged in user ${decoded.username}. IP=${getClientIp(socket)}`);
+                    log.info("auth", `Successfully logged in user ${decoded.username}. IP=${clientIP}`);
 
                     callback({
                         ok: true,
                     });
                 } else {
 
-                    log.info("auth", `Inactive or deleted user ${decoded.username}. IP=${getClientIp(socket)}`);
+                    log.info("auth", `Inactive or deleted user ${decoded.username}. IP=${clientIP}`);
 
                     callback({
                         ok: false,
@@ -296,7 +289,7 @@ try {
                 }
             } catch (error) {
 
-                log.error("auth", `Invalid token. IP=${getClientIp(socket)}`);
+                log.error("auth", `Invalid token. IP=${clientIP}`);
 
                 callback({
                     ok: false,
@@ -307,7 +300,9 @@ try {
         });
 
         socket.on("login", async (data, callback) => {
-            log.info("auth", `Login by username + password. IP=${getClientIp(socket)}`);
+            const clientIP = await server.getClientIP(socket);
+
+            log.info("auth", `Login by username + password. IP=${clientIP}`);
 
             // Checking
             if (typeof callback !== "function") {
@@ -320,17 +315,17 @@ try {
 
             // Login Rate Limit
             if (! await loginRateLimiter.pass(callback)) {
-                log.info("auth", `Too many failed requests for user ${data.username}. IP=${getClientIp(socket)}`);
+                log.info("auth", `Too many failed requests for user ${data.username}. IP=${clientIP}`);
                 return;
             }
 
             let user = await login(data.username, data.password);
 
             if (user) {
-                if (user.twofa_status == 0) {
+                if (user.twofa_status === 0) {
                     afterLogin(socket, user);
 
-                    log.info("auth", `Successfully logged in user ${data.username}. IP=${getClientIp(socket)}`);
+                    log.info("auth", `Successfully logged in user ${data.username}. IP=${clientIP}`);
 
                     callback({
                         ok: true,
@@ -340,9 +335,9 @@ try {
                     });
                 }
 
-                if (user.twofa_status == 1 && !data.token) {
+                if (user.twofa_status === 1 && !data.token) {
 
-                    log.info("auth", `2FA token required for user ${data.username}. IP=${getClientIp(socket)}`);
+                    log.info("auth", `2FA token required for user ${data.username}. IP=${clientIP}`);
 
                     callback({
                         tokenRequired: true,
@@ -360,7 +355,7 @@ try {
                             socket.userID,
                         ]);
 
-                        log.info("auth", `Successfully logged in user ${data.username}. IP=${getClientIp(socket)}`);
+                        log.info("auth", `Successfully logged in user ${data.username}. IP=${clientIP}`);
 
                         callback({
                             ok: true,
@@ -370,7 +365,7 @@ try {
                         });
                     } else {
 
-                        log.warn("auth", `Invalid token provided for user ${data.username}. IP=${getClientIp(socket)}`);
+                        log.warn("auth", `Invalid token provided for user ${data.username}. IP=${clientIP}`);
 
                         callback({
                             ok: false,
@@ -380,7 +375,7 @@ try {
                 }
             } else {
 
-                log.warn("auth", `Incorrect username or password for user ${data.username}. IP=${getClientIp(socket)}`);
+                log.warn("auth", `Incorrect username or password for user ${data.username}. IP=${clientIP}`);
 
                 callback({
                     ok: false,
@@ -417,7 +412,7 @@ try {
                     socket.userID,
                 ]);
 
-                if (user.twofa_status == 0) {
+                if (user.twofa_status === 0) {
                     let newSecret = genSecret();
                     let encodedSecret = base32.encode(newSecret);
 
@@ -452,6 +447,8 @@ try {
         });
 
         socket.on("save2FA", async (currentPassword, callback) => {
+            const clientIP = await server.getClientIP(socket);
+
             try {
                 if (! await twoFaRateLimiter.pass(callback)) {
                     return;
@@ -464,7 +461,7 @@ try {
                     socket.userID,
                 ]);
 
-                log.info("auth", `Saved 2FA token. IP=${getClientIp(socket)}`);
+                log.info("auth", `Saved 2FA token. IP=${clientIP}`);
 
                 callback({
                     ok: true,
@@ -472,7 +469,7 @@ try {
                 });
             } catch (error) {
 
-                log.error("auth", `Error changing 2FA token. IP=${getClientIp(socket)}`);
+                log.error("auth", `Error changing 2FA token. IP=${clientIP}`);
 
                 callback({
                     ok: false,
@@ -482,6 +479,8 @@ try {
         });
 
         socket.on("disable2FA", async (currentPassword, callback) => {
+            const clientIP = await server.getClientIP(socket);
+
             try {
                 if (! await twoFaRateLimiter.pass(callback)) {
                     return;
@@ -491,7 +490,7 @@ try {
                 await doubleCheckPassword(socket, currentPassword);
                 await TwoFA.disable2FA(socket.userID);
 
-                log.info("auth", `Disabled 2FA token. IP=${getClientIp(socket)}`);
+                log.info("auth", `Disabled 2FA token. IP=${clientIP}`);
 
                 callback({
                     ok: true,
@@ -499,7 +498,7 @@ try {
                 });
             } catch (error) {
 
-                log.error("auth", `Error disabling 2FA token. IP=${getClientIp(socket)}`);
+                log.error("auth", `Error disabling 2FA token. IP=${clientIP}`);
 
                 callback({
                     ok: false,
@@ -548,7 +547,7 @@ try {
                     socket.userID,
                 ]);
 
-                if (user.twofa_status == 1) {
+                if (user.twofa_status === 1) {
                     callback({
                         ok: true,
                         status: true,
@@ -670,9 +669,10 @@ try {
                 bean.basic_auth_pass = monitor.basic_auth_pass;
                 bean.interval = monitor.interval;
                 bean.retryInterval = monitor.retryInterval;
+                bean.resendInterval = monitor.resendInterval;
                 bean.hostname = monitor.hostname;
                 bean.maxretries = monitor.maxretries;
-                bean.port = monitor.port;
+                bean.port = parseInt(monitor.port);
                 bean.keyword = monitor.keyword;
                 bean.ignoreTls = monitor.ignoreTls;
                 bean.expiryNotification = monitor.expiryNotification;
@@ -682,11 +682,23 @@ try {
                 bean.dns_resolve_type = monitor.dns_resolve_type;
                 bean.dns_resolve_server = monitor.dns_resolve_server;
                 bean.pushToken = monitor.pushToken;
+                bean.docker_container = monitor.docker_container;
+                bean.docker_host = monitor.docker_host;
                 bean.proxyId = Number.isInteger(monitor.proxyId) ? monitor.proxyId : null;
                 bean.mqttUsername = monitor.mqttUsername;
                 bean.mqttPassword = monitor.mqttPassword;
                 bean.mqttTopic = monitor.mqttTopic;
                 bean.mqttSuccessMessage = monitor.mqttSuccessMessage;
+                bean.databaseConnectionString = monitor.databaseConnectionString;
+                bean.databaseQuery = monitor.databaseQuery;
+                bean.authMethod = monitor.authMethod;
+                bean.authWorkstation = monitor.authWorkstation;
+                bean.authDomain = monitor.authDomain;
+                bean.radiusUsername = monitor.radiusUsername;
+                bean.radiusPassword = monitor.radiusPassword;
+                bean.radiusCalledStationId = monitor.radiusCalledStationId;
+                bean.radiusCallingStationId = monitor.radiusCallingStationId;
+                bean.radiusSecret = monitor.radiusSecret;
 
                 await R.store(bean);
 
@@ -1060,7 +1072,13 @@ try {
             try {
                 checkLogin(socket);
 
-                if (data.disableAuth) {
+                // If currently is disabled auth, don't need to check
+                // Disabled Auth + Want to Disable Auth => No Check
+                // Disabled Auth + Want to Enable Auth => No Check
+                // Enabled Auth + Want to Disable Auth => Check!!
+                // Enabled Auth + Want to Enable Auth => No Check
+                const currentDisabledAuth = await setting("disableAuth");
+                if (!currentDisabledAuth && data.disableAuth) {
                     await doubleCheckPassword(socket, currentPassword);
                 }
 
@@ -1169,7 +1187,7 @@ try {
                 let version17x = compareVersions.compare(backupData.version, "1.7.0", ">=");
 
                 // If the import option is "overwrite" it'll clear most of the tables, except "settings" and "user"
-                if (importHandle == "overwrite") {
+                if (importHandle === "overwrite") {
                     // Stops every monitor first, so it doesn't execute any heartbeat while importing
                     for (let id in server.monitorList) {
                         let monitor = server.monitorList[id];
@@ -1193,7 +1211,7 @@ try {
 
                     for (let i = 0; i < notificationListData.length; i++) {
                         // Only starts importing the notification if the import option is "overwrite", "keep" or "skip" but the notification doesn't exists
-                        if ((importHandle == "skip" && notificationNameListString.includes(notificationListData[i].name) == false) || importHandle == "keep" || importHandle == "overwrite") {
+                        if ((importHandle === "skip" && notificationNameListString.includes(notificationListData[i].name) === false) || importHandle === "keep" || importHandle === "overwrite") {
 
                             let notification = JSON.parse(notificationListData[i].config);
                             await Notification.save(notification, null, socket.userID);
@@ -1228,7 +1246,7 @@ try {
 
                     for (let i = 0; i < monitorListData.length; i++) {
                         // Only starts importing the monitor if the import option is "overwrite", "keep" or "skip" but the notification doesn't exists
-                        if ((importHandle == "skip" && monitorNameListString.includes(monitorListData[i].name) == false) || importHandle == "keep" || importHandle == "overwrite") {
+                        if ((importHandle === "skip" && monitorNameListString.includes(monitorListData[i].name) === false) || importHandle === "keep" || importHandle === "overwrite") {
 
                             // Define in here every new variable for monitors which where implemented after the first version of the Import/Export function (1.6.0)
                             // --- Start ---
@@ -1254,10 +1272,14 @@ try {
                                 method: monitorListData[i].method || "GET",
                                 body: monitorListData[i].body,
                                 headers: monitorListData[i].headers,
+                                authMethod: monitorListData[i].authMethod,
                                 basic_auth_user: monitorListData[i].basic_auth_user,
                                 basic_auth_pass: monitorListData[i].basic_auth_pass,
+                                authWorkstation: monitorListData[i].authWorkstation,
+                                authDomain: monitorListData[i].authDomain,
                                 interval: monitorListData[i].interval,
                                 retryInterval: retryInterval,
+                                resendInterval: monitorListData[i].resendInterval || 0,
                                 hostname: monitorListData[i].hostname,
                                 maxretries: monitorListData[i].maxretries,
                                 port: monitorListData[i].port,
@@ -1325,7 +1347,7 @@ try {
                             await updateMonitorNotification(bean.id, notificationIDList);
 
                             // If monitor was active start it immediately, otherwise pause it
-                            if (monitorListData[i].active == 1) {
+                            if (monitorListData[i].active === 1) {
                                 await startMonitor(socket.userID, bean.id);
                             } else {
                                 await pauseMonitor(socket.userID, bean.id);
@@ -1426,6 +1448,7 @@ try {
         cloudflaredSocketHandler(socket);
         databaseSocketHandler(socket);
         proxySocketHandler(socket);
+        dockerSocketHandler(socket);
 
         log.debug("server", "added all socket handlers");
 
@@ -1473,11 +1496,11 @@ try {
 })();
 
 /**
- * Adds or removes notifications from a monitor.
- * @param {number} monitorID The ID of the monitor to add/remove notifications from.
- * @param {Array.<number>} notificationIDList An array of IDs for the notifications to add/remove.
- *
- * Generated by Trelent
+ * Update notifications for a given monitor
+ * @param {number} monitorID ID of monitor to update
+ * @param {number[]} notificationIDList List of new notification
+ * providers to add
+ * @returns {Promise<void>}
  */
 async function updateMonitorNotification(monitorID, notificationIDList) {
     await R.exec("DELETE FROM monitor_notification WHERE monitor_id = ? ", [
@@ -1495,11 +1518,11 @@ async function updateMonitorNotification(monitorID, notificationIDList) {
 }
 
 /**
- * This function checks if the user owns a monitor with the given ID.
- * @param {number} monitorID - The ID of the monitor to check ownership for.
- * @param {number} userID - The ID of the user who is trying to access this data.
- *
- * Generated by Trelent
+ * Check if a given user owns a specific monitor
+ * @param {number} userID
+ * @param {number} monitorID
+ * @returns {Promise<void>}
+ * @throws {Error} The specified user does not own the monitor
  */
 async function checkOwner(userID, monitorID) {
     let row = await R.getRow("SELECT id FROM monitor WHERE id = ? AND user_id = ? ", [
@@ -1513,8 +1536,11 @@ async function checkOwner(userID, monitorID) {
 }
 
 /**
+ * Function called after user login
  * This function is used to send the heartbeat list of a monitor.
- * @param {Socket} socket - The socket object that will be used to send the data.
+ * @param {Socket} socket Socket.io instance
+ * @param {Object} user User object
+ * @returns {Promise<void>}
  */
 async function afterLogin(socket, user) {
     socket.userID = user.id;
@@ -1523,6 +1549,7 @@ async function afterLogin(socket, user) {
     let monitorList = await server.sendMonitorList(socket);
     sendNotificationList(socket);
     sendProxyList(socket);
+    sendDockerHostList(socket);
 
     await sleep(500);
 
@@ -1542,9 +1569,10 @@ async function afterLogin(socket, user) {
 }
 
 /**
- * Connect to the database and patch it if necessary.
- *
- * Generated by Trelent
+ * Initialize the database
+ * @param {boolean} [testMode=false] Should the connection be
+ * started in test mode?
+ * @returns {Promise<void>}
  */
 async function initDatabase(testMode = false) {
     if (! fs.existsSync(Database.path)) {
@@ -1581,11 +1609,10 @@ async function initDatabase(testMode = false) {
 }
 
 /**
- * Resume a monitor.
- * @param {string} userID - The ID of the user who owns the monitor.
- * @param {string} monitorID - The ID of the monitor to resume.
- *
- * Generated by Trelent
+ * Start the specified monitor
+ * @param {number} userID ID of user who owns monitor
+ * @param {number} monitorID ID of monitor to start
+ * @returns {Promise<void>}
  */
 async function startMonitor(userID, monitorID) {
     await checkOwner(userID, monitorID);
@@ -1609,16 +1636,21 @@ async function startMonitor(userID, monitorID) {
     monitor.start(io);
 }
 
+/**
+ * Restart a given monitor
+ * @param {number} userID ID of user who owns monitor
+ * @param {number} monitorID ID of monitor to start
+ * @returns {Promise<void>}
+ */
 async function restartMonitor(userID, monitorID) {
     return await startMonitor(userID, monitorID);
 }
 
 /**
- * Pause a monitor.
- * @param {string} userID - The ID of the user who owns the monitor.
- * @param {string} monitorID - The ID of the monitor to pause.
- *
- * Generated by Trelent
+ * Pause a given monitor
+ * @param {number} userID ID of user who owns monitor
+ * @param {number} monitorID ID of monitor to start
+ * @returns {Promise<void>}
  */
 async function pauseMonitor(userID, monitorID) {
     await checkOwner(userID, monitorID);
@@ -1635,9 +1667,7 @@ async function pauseMonitor(userID, monitorID) {
     }
 }
 
-/**
- * Resume active monitors
- */
+/** Resume active monitors */
 async function startMonitors() {
     let list = await R.find("monitor", " active = 1 ");
 
@@ -1653,10 +1683,10 @@ async function startMonitors() {
 }
 
 /**
+ * Shutdown the application
  * Stops all monitors and closes the database connection.
  * @param {string} signal The signal that triggered this function to be called.
- *
- * Generated by Trelent
+ * @returns {Promise<void>}
  */
 async function shutdownFunction(signal) {
     log.info("server", "Shutdown requested");
@@ -1674,10 +1704,7 @@ async function shutdownFunction(signal) {
     await cloudflaredStop();
 }
 
-function getClientIp(socket) {
-    return socket.client.conn.remoteAddress.replace(/^.*:/, "");
-}
-
+/** Final function called before application exits */
 function finalFunction() {
     log.info("server", "Graceful shutdown successful!");
 }
@@ -1694,6 +1721,6 @@ gracefulShutdown(server.httpServer, {
 // Catch unexpected errors here
 process.addListener("unhandledRejection", (error, promise) => {
     console.trace(error);
-    errorLog(error, false);
+    UptimeKumaServer.errorLog(error, false);
     console.error("If you keep encountering errors, please report to https://github.com/louislam/uptime-kuma/issues");
 });

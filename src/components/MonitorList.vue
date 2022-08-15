@@ -47,8 +47,8 @@
 
 <script>
 import HeartbeatBar from "../components/HeartbeatBar.vue";
-import Uptime from "../components/Uptime.vue";
 import Tag from "../components/Tag.vue";
+import Uptime from "../components/Uptime.vue";
 import { getMonitorRelativeURL } from "../util.ts";
 
 export default {
@@ -58,6 +58,7 @@ export default {
         Tag,
     },
     props: {
+        /** Should the scrollbar be shown */
         scrollbar: {
             type: Boolean,
         },
@@ -69,10 +70,22 @@ export default {
         };
     },
     computed: {
+        /**
+         * Improve the sticky appearance of the list by increasing its
+         * height as user scrolls down.
+         * Not used on mobile.
+         */
         boxStyle() {
-            return {
-                height: `calc(100vh - 160px + ${this.windowTop}px)`,
-            };
+            if (window.innerWidth > 550) {
+                return {
+                    height: `calc(100vh - 160px + ${this.windowTop}px)`,
+                };
+            } else {
+                return {
+                    height: "calc(100vh - 160px)",
+                };
+            }
+
         },
 
         sortedMonitorList() {
@@ -105,7 +118,7 @@ export default {
 
             // Simple filter by search text
             // finds monitor name, tag name or tag value
-            if (this.searchText != "") {
+            if (this.searchText !== "") {
                 const loweredSearchText = this.searchText.toLowerCase();
                 result = result.filter(monitor => {
                     return monitor.name.toLowerCase().includes(loweredSearchText)
@@ -124,6 +137,7 @@ export default {
         window.removeEventListener("scroll", this.onScroll);
     },
     methods: {
+        /** Handle user scroll */
         onScroll() {
             if (window.top.scrollY <= 133) {
                 this.windowTop = window.top.scrollY;
@@ -131,9 +145,15 @@ export default {
                 this.windowTop = 133;
             }
         },
+        /**
+         * Get URL of monitor
+         * @param {number} id ID of monitor
+         * @returns {string} Relative URL of monitor
+         */
         monitorURL(id) {
             return getMonitorRelativeURL(id);
         },
+        /** Clear the search bar */
         clearSearchText() {
             this.searchText = "";
         }
@@ -167,12 +187,6 @@ export default {
     .dark & {
         background-color: $dark-header-bg;
         border-bottom: 0;
-    }
-}
-
-.dark {
-    .footer {
-        //  background-color: $dark-bg;
     }
 }
 

@@ -7,9 +7,20 @@ const { Resolver } = require("dns");
 const childProcess = require("child_process");
 const iconv = require("iconv-lite");
 const chardet = require("chardet");
-const fs = require("fs");
-const nodeJsUtil = require("util");
 const mqtt = require("mqtt");
+const chroma = require("chroma-js");
+const { badgeConstants } = require("./config");
+const mssql = require("mssql");
+const { Client } = require("pg");
+const postgresConParse = require("pg-connection-string").parse;
+const { NtlmClient } = require("axios-ntlm");
+const { Settings } = require("./settings");
+const radiusClient = require("node-radius-client");
+const {
+    dictionaries: {
+        rfc2865: { file, attributes },
+    },
+} = require("node-radius-utils");
 
 // From ping-lite
 exports.WIN = /^win/.test(process.platform);
@@ -37,6 +48,12 @@ exports.initJWTSecret = async () => {
     return jwtSecretBean;
 };
 
+/**
+ * Send TCP request to specified hostname and port
+ * @param {string} hostname Hostname / address of machine
+ * @param {number} port TCP port to test
+ * @returns {Promise<number>} Maximum time in ms rounded to nearest integer
+ */
 exports.tcping = function (hostname, port) {
     return new Promise((resolve, reject) => {
         tcpp.ping({
@@ -58,6 +75,11 @@ exports.tcping = function (hostname, port) {
     });
 };
 
+/**
+ * Ping the specified machine
+ * @param {string} hostname Hostname / address of machine
+ * @returns {Promise<number>} Time for ping in ms rounded to nearest integer
+ */
 exports.ping = async (hostname) => {
     try {
         return await exports.pingAsync(hostname);
@@ -71,6 +93,12 @@ exports.ping = async (hostname) => {
     }
 };
 
+/**
+ * Ping the specified machine
+ * @param {string} hostname Hostname / address of machine to ping
+ * @param {boolean} ipv6 Should IPv6 be used?
+ * @returns {Promise<number>} Time for ping in ms rounded to nearest integer
+ */
 exports.pingAsync = function (hostname, ipv6 = false) {
     return new Promise((resolve, reject) => {
         const ping = new Ping(hostname, {
@@ -89,6 +117,15 @@ exports.pingAsync = function (hostname, ipv6 = false) {
     });
 };
 
+/**
+ * MQTT Monitor
+ * @param {string} hostname Hostname / address of machine to test
+ * @param {string} topic MQTT topic
+ * @param {string} okMessage Expected result
+ * @param {Object} [options={}] MQTT options. Contains port, username,
+ * password and interval (interval defaults to 20)
+ * @returns {Promise<string>}
+ */
 exports.mqttAsync = function (hostname, topic, okMessage, options = {}) {
     return new Promise((resolve, reject) => {
         const { port, username, password, interval = 20 } = options;
@@ -132,7 +169,7 @@ exports.mqttAsync = function (hostname, topic, okMessage, options = {}) {
         });
 
         client.on("message", (messageTopic, message) => {
-            if (messageTopic == topic) {
+            if (messageTopic === topic) {
                 client.end();
                 clearTimeout(timeoutID);
                 if (okMessage != null && okMessage !== "" && message.toString() !== okMessage) {
@@ -146,9 +183,40 @@ exports.mqttAsync = function (hostname, topic, okMessage, options = {}) {
     });
 };
 
-exports.dnsResolve = function (hostname, resolverServer, rrtype) {
+/**
+ * Use NTLM Auth for a http request.
+ * @param {Object} options The http request options
+ * @param {Object} ntlmOptions The auth options
+ * @returns {Promise<(string[]|Object[]|Object)>}
+ */
+exports.httpNtlm = function (options, ntlmOptions) {
+    return new Promise((resolve, reject) => {
+        let client = NtlmClient(ntlmOptions);
+
+        client(options)
+            .then((resp) => {
+                resolve(resp);
+            })
+            .catch((err) => {
+                reject(err);
+            });
+    });
+};
+
+/**
+ * Resolves a given record using the specified DNS server
+ * @param {string} hostname The hostname of the record to lookup
+ * @param {string} resolverServer The DNS server to use
+ * @param {string} resolverPort Port the DNS server is listening on
+ * @param {string} rrtype The type of record to request
+ * @returns {Promise<(string[]|Object[]|Object)>}
+ */
+exports.dnsResolve = function (hostname, resolverServer, resolverPort, rrtype) {
     const resolver = new Resolver();
-    resolver.setServers([ resolverServer ]);
+    // Remove brackets from IPv6 addresses so we can re-add them to
+    // prevent issues with ::1:5300 (::1 port 5300)
+    resolverServer = resolverServer.replace("[", "").replace("]", "");
+    resolver.setServers([ `[${resolverServer}]:${resolverPort}` ]);
     return new Promise((resolve, reject) => {
         if (rrtype === "PTR") {
             resolver.reverse(hostname, (err, records) => {
@@ -170,83 +238,141 @@ exports.dnsResolve = function (hostname, resolverServer, rrtype) {
     });
 };
 
+/**
+ * Run a query on SQL Server
+ * @param {string} connectionString The database connection string
+ * @param {string} query The query to validate the database with
+ * @returns {Promise<(string[]|Object[]|Object)>}
+ */
+exports.mssqlQuery = function (connectionString, query) {
+    return new Promise((resolve, reject) => {
+        mssql.connect(connectionString).then(pool => {
+            return pool.request()
+                .query(query);
+        }).then(result => {
+            resolve(result);
+        }).catch(err => {
+            reject(err);
+        }).finally(() => {
+            mssql.close();
+        });
+    });
+};
+
+/**
+ * Run a query on Postgres
+ * @param {string} connectionString The database connection string
+ * @param {string} query The query to validate the database with
+ * @returns {Promise<(string[]|Object[]|Object)>}
+ */
+exports.postgresQuery = function (connectionString, query) {
+    return new Promise((resolve, reject) => {
+        const config = postgresConParse(connectionString);
+
+        if (config.password === "") {
+            // See https://github.com/brianc/node-postgres/issues/1927
+            return reject(new Error("Password is undefined."));
+        }
+
+        const client = new Client({ connectionString });
+
+        client.connect();
+
+        return client.query(query)
+            .then(res => {
+                resolve(res);
+            })
+            .catch(err => {
+                reject(err);
+            })
+            .finally(() => {
+                client.end();
+            });
+    });
+};
+
+exports.radius = function (
+    hostname,
+    username,
+    password,
+    calledStationId,
+    callingStationId,
+    secret,
+) {
+    const client = new radiusClient({
+        host: hostname,
+        dictionaries: [ file ],
+    });
+
+    return client.accessRequest({
+        secret: secret,
+        attributes: [
+            [ attributes.USER_NAME, username ],
+            [ attributes.USER_PASSWORD, password ],
+            [ attributes.CALLING_STATION_ID, callingStationId ],
+            [ attributes.CALLED_STATION_ID, calledStationId ],
+        ],
+    });
+};
+
+/**
+ * Retrieve value of setting based on key
+ * @param {string} key Key of setting to retrieve
+ * @returns {Promise<any>} Value
+ * @deprecated Use await Settings.get(key)
+ */
 exports.setting = async function (key) {
-    let value = await R.getCell("SELECT `value` FROM setting WHERE `key` = ? ", [
-        key,
-    ]);
-
-    try {
-        const v = JSON.parse(value);
-        log.debug("util", `Get Setting: ${key}: ${v}`);
-        return v;
-    } catch (e) {
-        return value;
-    }
+    return await Settings.get(key);
 };
 
+/**
+ * Sets the specified setting to specifed value
+ * @param {string} key Key of setting to set
+ * @param {any} value Value to set to
+ * @param {?string} type Type of setting
+ * @returns {Promise<void>}
+ */
 exports.setSetting = async function (key, value, type = null) {
-    let bean = await R.findOne("setting", " `key` = ? ", [
-        key,
-    ]);
-    if (!bean) {
-        bean = R.dispense("setting");
-        bean.key = key;
-    }
-    bean.type = type;
-    bean.value = JSON.stringify(value);
-    await R.store(bean);
+    await Settings.set(key, value, type);
 };
 
+/**
+ * Get settings based on type
+ * @param {string} type The type of setting
+ * @returns {Promise<Bean>}
+ */
 exports.getSettings = async function (type) {
-    let list = await R.getAll("SELECT `key`, `value` FROM setting WHERE `type` = ? ", [
-        type,
-    ]);
-
-    let result = {};
-
-    for (let row of list) {
-        try {
-            result[row.key] = JSON.parse(row.value);
-        } catch (e) {
-            result[row.key] = row.value;
-        }
-    }
-
-    return result;
+    return await Settings.getSettings(type);
 };
 
+/**
+ * Set settings based on type
+ * @param {string} type Type of settings to set
+ * @param {Object} data Values of settings
+ * @returns {Promise<void>}
+ */
 exports.setSettings = async function (type, data) {
-    let keyList = Object.keys(data);
-
-    let promiseList = [];
-
-    for (let key of keyList) {
-        let bean = await R.findOne("setting", " `key` = ? ", [
-            key
-        ]);
-
-        if (bean == null) {
-            bean = R.dispense("setting");
-            bean.type = type;
-            bean.key = key;
-        }
-
-        if (bean.type === type) {
-            bean.value = JSON.stringify(data[key]);
-            promiseList.push(R.store(bean));
-        }
-    }
-
-    await Promise.all(promiseList);
+    await Settings.setSettings(type, data);
 };
 
 // ssl-checker by @dyaa
-// param: res - response object from axios
-// return an object containing the certificate information
+//https://github.com/dyaa/ssl-checker/blob/master/src/index.ts
 
+/**
+ * Get number of days between two dates
+ * @param {Date} validFrom Start date
+ * @param {Date} validTo End date
+ * @returns {number}
+ */
 const getDaysBetween = (validFrom, validTo) =>
     Math.round(Math.abs(+validFrom - +validTo) / 8.64e7);
 
+/**
+ * Get days remaining from a time range
+ * @param {Date} validFrom Start date
+ * @param {Date} validTo End date
+ * @returns {number}
+ */
 const getDaysRemaining = (validFrom, validTo) => {
     const daysRemaining = getDaysBetween(validFrom, validTo);
     if (new Date(validTo).getTime() < new Date().getTime()) {
@@ -255,8 +381,11 @@ const getDaysRemaining = (validFrom, validTo) => {
     return daysRemaining;
 };
 
-// Fix certificate Info for display
-// param: info -  the chain obtained from getPeerCertificate()
+/**
+ * Fix certificate info for display
+ * @param {Object} info The chain obtained from getPeerCertificate()
+ * @returns {Object} An object representing certificate information
+ */
 const parseCertificateInfo = function (info) {
     let link = info;
     let i = 0;
@@ -296,6 +425,11 @@ const parseCertificateInfo = function (info) {
     return info;
 };
 
+/**
+ * Check if certificate is valid
+ * @param {Object} res Response object from axios
+ * @returns {Object} Object containing certificate information
+ */
 exports.checkCertificate = function (res) {
     const info = res.request.res.socket.getPeerCertificate(true);
     const valid = res.request.res.socket.authorized || false;
@@ -309,12 +443,13 @@ exports.checkCertificate = function (res) {
     };
 };
 
-// Check if the provided status code is within the accepted ranges
-// Param: status - the status code to check
-// Param: accepted_codes - an array of accepted status codes
-// Return: true if the status code is within the accepted ranges, false otherwise
-// Will throw an error if the provided status code is not a valid range string or code string
-
+/**
+ * Check if the provided status code is within the accepted ranges
+ * @param {number} status The status code to check
+ * @param {string[]} acceptedCodes An array of accepted status codes
+ * @returns {boolean} True if status code within range, false otherwise
+ * @throws {Error} Will throw an error if the provided status code is not a valid range string or code string
+ */
 exports.checkStatusCode = function (status, acceptedCodes) {
     if (acceptedCodes == null || acceptedCodes.length === 0) {
         return false;
@@ -338,6 +473,12 @@ exports.checkStatusCode = function (status, acceptedCodes) {
     return false;
 };
 
+/**
+ * Get total number of clients in room
+ * @param {Server} io Socket server instance
+ * @param {string} roomName Name of room to check
+ * @returns {number}
+ */
 exports.getTotalClientInRoom = (io, roomName) => {
 
     const sockets = io.sockets;
@@ -361,17 +502,29 @@ exports.getTotalClientInRoom = (io, roomName) => {
     }
 };
 
+/**
+ * Allow CORS all origins if development
+ * @param {Object} res Response object from axios
+ */
 exports.allowDevAllOrigin = (res) => {
     if (process.env.NODE_ENV === "development") {
         exports.allowAllOrigin(res);
     }
 };
 
+/**
+ * Allow CORS all origins
+ * @param {Object} res Response object from axios
+ */
 exports.allowAllOrigin = (res) => {
     res.header("Access-Control-Allow-Origin", "*");
     res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
 };
 
+/**
+ * Check if a user is logged in
+ * @param {Socket} socket Socket instance
+ */
 exports.checkLogin = (socket) => {
     if (!socket.userID) {
         throw new Error("You are not logged in.");
@@ -380,8 +533,8 @@ exports.checkLogin = (socket) => {
 
 /**
  * For logged-in users, double-check the password
- * @param socket
- * @param currentPassword
+ * @param {Socket} socket Socket.io instance
+ * @param {string} currentPassword
  * @returns {Promise<Bean>}
  */
 exports.doubleCheckPassword = async (socket, currentPassword) => {
@@ -400,6 +553,7 @@ exports.doubleCheckPassword = async (socket, currentPassword) => {
     return user;
 };
 
+/** Start Unit tests */
 exports.startUnitTest = async () => {
     console.log("Starting unit test...");
     const npm = /^win/.test(process.platform) ? "npm.cmd" : "npm";
@@ -420,7 +574,8 @@ exports.startUnitTest = async () => {
 };
 
 /**
- * @param body : Buffer
+ * Convert unknown string to UTF8
+ * @param {Uint8Array} body Buffer
  * @returns {string}
  */
 exports.convertToUTF8 = (body) => {
@@ -429,23 +584,44 @@ exports.convertToUTF8 = (body) => {
     return str.toString();
 };
 
-let logFile;
-
-try {
-    logFile = fs.createWriteStream("./data/error.log", {
-        flags: "a"
-    });
-} catch (_) { }
-
-exports.errorLog = (error, outputToConsole = true) => {
+/**
+ * Returns a color code in hex format based on a given percentage:
+ * 0% => hue = 10 => red
+ * 100% => hue = 90 => green
+ *
+ * @param {number} percentage float, 0 to 1
+ * @param {number} maxHue
+ * @param {number} minHue, int
+ * @returns {string}, hex value
+ */
+exports.percentageToColor = (percentage, maxHue = 90, minHue = 10) => {
+    const hue = percentage * (maxHue - minHue) + minHue;
     try {
-        if (logFile) {
-            const dateTime = R.isoDateTime();
-            logFile.write(`[${dateTime}] ` + nodeJsUtil.format(error) + "\n");
+        return chroma(`hsl(${hue}, 90%, 40%)`).hex();
+    } catch (err) {
+        return badgeConstants.naColor;
+    }
+};
 
-            if (outputToConsole) {
-                console.error(error);
-            }
-        }
-    } catch (_) { }
+/**
+ * Joins and array of string to one string after filtering out empty values
+ *
+ * @param {string[]} parts
+ * @param {string} connector
+ * @returns {string}
+ */
+exports.filterAndJoin = (parts, connector = "") => {
+    return parts.filter((part) => !!part && part !== "").join(connector);
+};
+
+/**
+ * Send a 403 response
+ * @param {Object} res Express response object
+ * @param {string} [msg=""] Message to send
+ */
+module.exports.send403 = (res, msg = "") => {
+    res.status(403).json({
+        "status": "fail",
+        "msg": msg,
+    });
 };

@@ -7,7 +7,7 @@ dayjs.extend(timezone);
 const axios = require("axios");
 const { Prometheus } = require("../prometheus");
 const { log, UP, DOWN, PENDING, flipStatus, TimeLogger } = require("../../src/util");
-const { tcping, ping, dnsResolve, checkCertificate, checkStatusCode, getTotalClientInRoom, setting, errorLog, mqttAsync } = require("../util-server");
+const { tcping, ping, dnsResolve, checkCertificate, checkStatusCode, getTotalClientInRoom, setting, mssqlQuery, postgresQuery, mqttAsync, setSetting, httpNtlm, radius } = require("../util-server");
 const { R } = require("redbean-node");
 const { BeanModel } = require("redbean-node/dist/bean-model");
 const { Notification } = require("../notification");
@@ -15,6 +15,8 @@ const { Proxy } = require("../proxy");
 const { demoMode } = require("../config");
 const version = require("../../package.json").version;
 const apicache = require("../modules/apicache");
+const { UptimeKumaServer } = require("../uptime-kuma-server");
+const { CacheableDnsHttpAgent } = require("../cacheable-dns-http-agent");
 
 /**
  * status:
@@ -27,12 +29,19 @@ class Monitor extends BeanModel {
     /**
      * Return an object that ready to parse to JSON for public
      * Only show necessary data to public
+     * @returns {Object}
      */
     async toPublicJSON(showTags = false) {
         let obj = {
             id: this.id,
             name: this.name,
+            sendUrl: this.sendUrl,
         };
+
+        if (this.sendUrl) {
+            obj.url = this.url;
+        }
+
         if (showTags) {
             obj.tags = await this.getTags();
         }
@@ -41,6 +50,7 @@ class Monitor extends BeanModel {
 
     /**
      * Return an object that ready to parse to JSON
+     * @returns {Object}
      */
     async toJSON(includeSensitiveData = true) {
 
@@ -69,6 +79,7 @@ class Monitor extends BeanModel {
             type: this.type,
             interval: this.interval,
             retryInterval: this.retryInterval,
+            resendInterval: this.resendInterval,
             keyword: this.keyword,
             expiryNotification: this.isEnabledExpiryNotification(),
             ignoreTls: this.getIgnoreTls(),
@@ -78,13 +89,26 @@ class Monitor extends BeanModel {
             dns_resolve_type: this.dns_resolve_type,
             dns_resolve_server: this.dns_resolve_server,
             dns_last_result: this.dns_last_result,
+            pushToken: this.pushToken,
+            docker_container: this.docker_container,
+            docker_host: this.docker_host,
             proxyId: this.proxy_id,
             notificationIDList,
             tags: tags,
             mqttUsername: this.mqttUsername,
             mqttPassword: this.mqttPassword,
             mqttTopic: this.mqttTopic,
-            mqttSuccessMessage: this.mqttSuccessMessage
+            mqttSuccessMessage: this.mqttSuccessMessage,
+            databaseConnectionString: this.databaseConnectionString,
+            databaseQuery: this.databaseQuery,
+            authMethod: this.authMethod,
+            authWorkstation: this.authWorkstation,
+            authDomain: this.authDomain,
+            radiusUsername: this.radiusUsername,
+            radiusPassword: this.radiusPassword,
+            radiusCalledStationId: this.radiusCalledStationId,
+            radiusCallingStationId: this.radiusCallingStationId,
+            radiusSecret: this.radiusSecret,
         };
 
         if (includeSensitiveData) {
@@ -101,6 +125,10 @@ class Monitor extends BeanModel {
         return data;
     }
 
+    /**
+     * Get all tags applied to this monitor
+     * @returns {Promise<LooseObject<any>[]>}
+     */
     async getTags() {
         return await R.getAll("SELECT mt.*, tag.name, tag.color FROM monitor_tag mt JOIN tag ON mt.tag_id = tag.id WHERE mt.monitor_id = ?", [ this.id ]);
     }
@@ -114,6 +142,10 @@ class Monitor extends BeanModel {
         return Buffer.from(user + ":" + pass).toString("base64");
     }
 
+    /**
+     * Is the TLS expiry notification enabled?
+     * @returns {boolean}
+     */
     isEnabledExpiryNotification() {
         return Boolean(this.expiryNotification);
     }
@@ -134,10 +166,18 @@ class Monitor extends BeanModel {
         return Boolean(this.upsideDown);
     }
 
+    /**
+     * Get accepted status codes
+     * @returns {Object}
+     */
     getAcceptedStatuscodes() {
         return JSON.parse(this.accepted_statuscodes_json);
     }
 
+    /**
+     * Start monitor
+     * @param {Server} io Socket server instance
+     */
     start(io) {
         let previousBeat = null;
         let retries = 0;
@@ -163,7 +203,7 @@ class Monitor extends BeanModel {
             // undefined if not https
             let tlsInfo = undefined;
 
-            if (!previousBeat) {
+            if (!previousBeat || this.type === "push") {
                 previousBeat = await R.findOne("heartbeat", " monitor_id = ? ORDER BY time DESC", [
                     this.id,
                 ]);
@@ -173,8 +213,9 @@ class Monitor extends BeanModel {
 
             let bean = R.dispense("heartbeat");
             bean.monitor_id = this.id;
-            bean.time = R.isoDateTime(dayjs.utc());
+            bean.time = R.isoDateTimeMillis(dayjs.utc());
             bean.status = DOWN;
+            bean.downCount = previousBeat?.downCount || 0;
 
             if (this.isUpsideDown()) {
                 bean.status = flipStatus(bean.status);
@@ -194,7 +235,7 @@ class Monitor extends BeanModel {
 
                     // HTTP basic auth
                     let basicAuthHeader = {};
-                    if (this.basic_auth_user) {
+                    if (this.auth_method === "basic") {
                         basicAuthHeader = {
                             "Authorization": "Basic " + this.encodeBase64(this.basic_auth_user, this.basic_auth_pass),
                         };
@@ -245,7 +286,21 @@ class Monitor extends BeanModel {
                     log.debug("monitor", `[${this.name}] Axios Options: ${JSON.stringify(options)}`);
                     log.debug("monitor", `[${this.name}] Axios Request`);
 
-                    let res = await axios.request(options);
+                    let res;
+                    if (this.auth_method === "ntlm") {
+                        options.httpsAgent.keepAlive = true;
+
+                        res = await httpNtlm(options, {
+                            username: this.basic_auth_user,
+                            password: this.basic_auth_pass,
+                            domain: this.authDomain,
+                            workstation: this.authWorkstation ? this.authWorkstation : undefined
+                        });
+
+                    } else {
+                        res = await axios.request(options);
+                    }
+
                     bean.msg = `${res.status} - ${res.statusText}`;
                     bean.ping = dayjs().valueOf() - startTime;
 
@@ -293,7 +348,11 @@ class Monitor extends BeanModel {
                             bean.msg += ", keyword is found";
                             bean.status = UP;
                         } else {
-                            throw new Error(bean.msg + ", but keyword is not found");
+                            data = data.replace(/<[^>]*>?|[\n\r]|\s+/gm, " ");
+                            if (data.length > 50) {
+                                data = data.substring(0, 47) + "...";
+                            }
+                            throw new Error(bean.msg + ", but keyword is not in [" + data + "]");
                         }
 
                     }
@@ -311,7 +370,7 @@ class Monitor extends BeanModel {
                     let startTime = dayjs().valueOf();
                     let dnsMessage = "";
 
-                    let dnsRes = await dnsResolve(this.hostname, this.dns_resolve_server, this.dns_resolve_type);
+                    let dnsRes = await dnsResolve(this.hostname, this.dns_resolve_server, this.port, this.dns_resolve_type);
                     bean.ping = dayjs().valueOf() - startTime;
 
                     if (this.dns_resolve_type === "A" || this.dns_resolve_type === "AAAA" || this.dns_resolve_type === "TXT") {
@@ -348,25 +407,33 @@ class Monitor extends BeanModel {
                     bean.msg = dnsMessage;
                     bean.status = UP;
                 } else if (this.type === "push") {      // Type: Push
-                    const time = R.isoDateTime(dayjs.utc().subtract(this.interval, "second"));
+                    log.debug("monitor", `[${this.name}] Checking monitor at ${dayjs().format("YYYY-MM-DD HH:mm:ss.SSS")}`);
+                    const bufferTime = 1000; // 1s buffer to accommodate clock differences
 
-                    let heartbeatCount = await R.count("heartbeat", " monitor_id = ? AND time > ? ", [
-                        this.id,
-                        time
-                    ]);
+                    if (previousBeat) {
+                        const msSinceLastBeat = dayjs.utc().valueOf() - dayjs.utc(previousBeat.time).valueOf();
 
-                    log.debug("monitor", "heartbeatCount" + heartbeatCount + " " + time);
+                        log.debug("monitor", `[${this.name}] msSinceLastBeat = ${msSinceLastBeat}`);
 
-                    if (heartbeatCount <= 0) {
-                        // Fix #922, since previous heartbeat could be inserted by api, it should get from database
-                        previousBeat = await Monitor.getPreviousHeartbeat(this.id);
-
-                        throw new Error("No heartbeat in the time window");
+                        // If the previous beat was down or pending we use the regular
+                        // beatInterval/retryInterval in the setTimeout further below
+                        if (previousBeat.status !== (this.isUpsideDown() ? DOWN : UP) || msSinceLastBeat > beatInterval * 1000 + bufferTime) {
+                            throw new Error("No heartbeat in the time window");
+                        } else {
+                            let timeout = beatInterval * 1000 - msSinceLastBeat;
+                            if (timeout < 0) {
+                                timeout = bufferTime;
+                            } else {
+                                timeout += bufferTime;
+                            }
+                            // No need to insert successful heartbeat for push type, so end here
+                            retries = 0;
+                            log.debug("monitor", `[${this.name}] timeout = ${timeout}`);
+                            this.heartbeatInterval = setTimeout(beat, timeout);
+                            return;
+                        }
                     } else {
-                        // No need to insert successful heartbeat for push type, so end here
-                        retries = 0;
-                        this.heartbeatInterval = setTimeout(beat, beatInterval * 1000);
-                        return;
+                        throw new Error("No heartbeat in the time window");
                     }
 
                 } else if (this.type === "steam") {
@@ -384,9 +451,12 @@ class Monitor extends BeanModel {
                             "Accept": "*/*",
                             "User-Agent": "Uptime-Kuma/" + version,
                         },
-                        httpsAgent: new https.Agent({
+                        httpsAgent: CacheableDnsHttpAgent.getHttpsAgent({
                             maxCachedSessions: 0,      // Use Custom agent to disable session reuse (https://github.com/nodejs/node/issues/3940)
                             rejectUnauthorized: !this.getIgnoreTls(),
+                        }),
+                        httpAgent: CacheableDnsHttpAgent.getHttpAgent({
+                            maxCachedSessions: 0,
                         }),
                         maxRedirects: this.maxredirects,
                         validateStatus: (status) => {
@@ -408,6 +478,35 @@ class Monitor extends BeanModel {
                     } else {
                         throw new Error("Server not found on Steam");
                     }
+                } else if (this.type === "docker") {
+                    log.debug(`[${this.name}] Prepare Options for Axios`);
+
+                    const dockerHost = await R.load("docker_host", this.docker_host);
+
+                    const options = {
+                        url: `/containers/${this.docker_container}/json`,
+                        headers: {
+                            "Accept": "*/*",
+                            "User-Agent": "Uptime-Kuma/" + version,
+                        },
+                        httpsAgent: new https.Agent({
+                            maxCachedSessions: 0,      // Use Custom agent to disable session reuse (https://github.com/nodejs/node/issues/3940)
+                            rejectUnauthorized: ! this.getIgnoreTls(),
+                        }),
+                    };
+
+                    if (dockerHost._dockerType === "socket") {
+                        options.socketPath = dockerHost._dockerDaemon;
+                    } else if (dockerHost._dockerType === "tcp") {
+                        options.baseURL = dockerHost._dockerDaemon;
+                    }
+
+                    log.debug(`[${this.name}] Axios Request`);
+                    let res = await axios.request(options);
+                    if (res.data.State.Running) {
+                        bean.status = UP;
+                        bean.msg = "";
+                    }
                 } else if (this.type === "mqtt") {
                     bean.msg = await mqttAsync(this.hostname, this.mqttTopic, this.mqttSuccessMessage, {
                         port: this.port,
@@ -416,6 +515,46 @@ class Monitor extends BeanModel {
                         interval: this.interval,
                     });
                     bean.status = UP;
+                } else if (this.type === "sqlserver") {
+                    let startTime = dayjs().valueOf();
+
+                    await mssqlQuery(this.databaseConnectionString, this.databaseQuery);
+
+                    bean.msg = "";
+                    bean.status = UP;
+                    bean.ping = dayjs().valueOf() - startTime;
+                } else if (this.type === "postgres") {
+                    let startTime = dayjs().valueOf();
+
+                    await postgresQuery(this.databaseConnectionString, this.databaseQuery);
+
+                    bean.msg = "";
+                    bean.status = UP;
+                    bean.ping = dayjs().valueOf() - startTime;
+                } else if (this.type === "radius") {
+                    let startTime = dayjs().valueOf();
+                    try {
+                        const resp = await radius(
+                            this.hostname,
+                            this.radiusUsername,
+                            this.radiusPassword,
+                            this.radiusCalledStationId,
+                            this.radiusCallingStationId,
+                            this.radiusSecret
+                        );
+                        if (resp.code) {
+                            bean.msg = resp.code;
+                        }
+                        bean.status = UP;
+                    } catch (error) {
+                        bean.status = DOWN;
+                        if (error.response?.code) {
+                            bean.msg = error.response.code;
+                        } else {
+                            bean.msg = error.message;
+                        }
+                    }
+                    bean.ping = dayjs().valueOf() - startTime;
                 } else {
                     bean.msg = "Unknown Monitor Type";
                     bean.status = PENDING;
@@ -457,23 +596,38 @@ class Monitor extends BeanModel {
                 log.debug("monitor", `[${this.name}] sendNotification`);
                 await Monitor.sendNotification(isFirstBeat, this, bean);
 
+                // Reset down count
+                bean.downCount = 0;
+
                 // Clear Status Page Cache
                 log.debug("monitor", `[${this.name}] apicache clear`);
                 apicache.clear();
 
             } else {
                 bean.important = false;
+
+                if (bean.status === DOWN && this.resendInterval > 0) {
+                    ++bean.downCount;
+                    if (bean.downCount >= this.resendInterval) {
+                        // Send notification again, because we are still DOWN
+                        log.debug("monitor", `[${this.name}] sendNotification again: Down Count: ${bean.downCount} | Resend Interval: ${this.resendInterval}`);
+                        await Monitor.sendNotification(isFirstBeat, this, bean);
+
+                        // Reset down count
+                        bean.downCount = 0;
+                    }
+                }
             }
 
             if (bean.status === UP) {
-                log.info("monitor", `Monitor #${this.id} '${this.name}': Successful Response: ${bean.ping} ms | Interval: ${beatInterval} seconds | Type: ${this.type}`);
+                log.debug("monitor", `Monitor #${this.id} '${this.name}': Successful Response: ${bean.ping} ms | Interval: ${beatInterval} seconds | Type: ${this.type}`);
             } else if (bean.status === PENDING) {
                 if (this.retryInterval > 0) {
                     beatInterval = this.retryInterval;
                 }
                 log.warn("monitor", `Monitor #${this.id} '${this.name}': Pending: ${bean.msg} | Max retries: ${this.maxretries} | Retry: ${retries} | Retry Interval: ${beatInterval} seconds | Type: ${this.type}`);
             } else {
-                log.warn("monitor", `Monitor #${this.id} '${this.name}': Failing: ${bean.msg} | Interval: ${beatInterval} seconds | Type: ${this.type}`);
+                log.warn("monitor", `Monitor #${this.id} '${this.name}': Failing: ${bean.msg} | Interval: ${beatInterval} seconds | Type: ${this.type} | Down Count: ${bean.downCount} | Resend Interval: ${this.resendInterval}`);
             }
 
             log.debug("monitor", `[${this.name}] Send to socket`);
@@ -497,12 +651,13 @@ class Monitor extends BeanModel {
 
         };
 
+        /** Get a heartbeat and handle errors */
         const safeBeat = async () => {
             try {
                 await beat();
             } catch (e) {
                 console.trace(e);
-                errorLog(e, false);
+                UptimeKumaServer.errorLog(e, false);
                 log.error("monitor", "Please report to https://github.com/louislam/uptime-kuma/issues");
 
                 if (! this.isStop) {
@@ -522,6 +677,7 @@ class Monitor extends BeanModel {
         }
     }
 
+    /** Stop monitor */
     stop() {
         clearTimeout(this.heartbeatInterval);
         this.isStop = true;
@@ -529,6 +685,10 @@ class Monitor extends BeanModel {
         this.prometheus().remove();
     }
 
+    /**
+     * Get a new prometheus instance
+     * @returns {Prometheus}
+     */
     prometheus() {
         return new Prometheus(this);
     }
@@ -537,7 +697,7 @@ class Monitor extends BeanModel {
      * Helper Method:
      * returns URL object for further usage
      * returns null if url is invalid
-     * @returns {null|URL}
+     * @returns {(null|URL)}
      */
     getUrl() {
         try {
@@ -550,7 +710,7 @@ class Monitor extends BeanModel {
     /**
      * Store TLS info to database
      * @param checkCertificateResult
-     * @returns {Promise<object>}
+     * @returns {Promise<Object>}
      */
     async updateTlsInfo(checkCertificateResult) {
         let tlsInfoBean = await R.findOne("monitor_tls_info", "monitor_id = ?", [
@@ -592,6 +752,12 @@ class Monitor extends BeanModel {
         return checkCertificateResult;
     }
 
+    /**
+     * Send statistics to clients
+     * @param {Server} io Socket server instance
+     * @param {number} monitorID ID of monitor to send
+     * @param {number} userID ID of user to send to
+     */
     static async sendStats(io, monitorID, userID) {
         const hasClients = getTotalClientInRoom(io, userID) > 0;
 
@@ -606,8 +772,8 @@ class Monitor extends BeanModel {
     }
 
     /**
-     *
-     * @param duration : int Hours
+     * Send the average ping to user
+     * @param {number} duration Hours
      */
     static async sendAvgPing(duration, io, monitorID, userID) {
         const timeLogger = new TimeLogger();
@@ -627,6 +793,12 @@ class Monitor extends BeanModel {
         io.to(userID).emit("avgPing", monitorID, avgPing);
     }
 
+    /**
+     * Send certificate information to client
+     * @param {Server} io Socket server instance
+     * @param {number} monitorID ID of monitor to send
+     * @param {number} userID ID of user to send to
+     */
     static async sendCertInfo(io, monitorID, userID) {
         let tlsInfo = await R.findOne("monitor_tls_info", "monitor_id = ?", [
             monitorID,
@@ -640,7 +812,8 @@ class Monitor extends BeanModel {
      * Uptime with calculation
      * Calculation based on:
      * https://www.uptrends.com/support/kb/reporting/calculation-of-uptime-and-downtime
-     * @param duration : int Hours
+     * @param {number} duration Hours
+     * @param {number} monitorID ID of monitor to calculate
      */
     static async calcUptime(duration, monitorID) {
         const timeLogger = new TimeLogger();
@@ -694,7 +867,7 @@ class Monitor extends BeanModel {
 
         } else {
             // Handle new monitor with only one beat, because the beat's duration = 0
-            let status = parseInt(await R.getCell("SELECT `status` FROM heartbeat WHERE monitor_id = ?", [monitorID]));
+            let status = parseInt(await R.getCell("SELECT `status` FROM heartbeat WHERE monitor_id = ?", [ monitorID ]));
 
             if (status === UP) {
                 uptime = 1;
@@ -706,13 +879,23 @@ class Monitor extends BeanModel {
 
     /**
      * Send Uptime
-     * @param duration : int Hours
+     * @param {number} duration Hours
+     * @param {Server} io Socket server instance
+     * @param {number} monitorID ID of monitor to send
+     * @param {number} userID ID of user to send to
      */
     static async sendUptime(duration, io, monitorID, userID) {
         const uptime = await this.calcUptime(duration, monitorID);
         io.to(userID).emit("uptime", monitorID, duration, uptime);
     }
 
+    /**
+     * Has status of monitor changed since last beat?
+     * @param {boolean} isFirstBeat Is this the first beat of this monitor?
+     * @param {const} previousBeatStatus Status of the previous beat
+     * @param {const} currentBeatStatus Status of the current beat
+     * @returns {boolean} True if is an important beat else false
+     */
     static isImportantBeat(isFirstBeat, previousBeatStatus, currentBeatStatus) {
         // * ? -> ANY STATUS = important [isFirstBeat]
         // UP -> PENDING = not important
@@ -731,6 +914,12 @@ class Monitor extends BeanModel {
         return isImportant;
     }
 
+    /**
+     * Send a notification about a monitor
+     * @param {boolean} isFirstBeat Is this beat the first of this monitor?
+     * @param {Monitor} monitor The monitor to send a notificaton about
+     * @param {Bean} bean Status information about monitor
+     */
     static async sendNotification(isFirstBeat, monitor, bean) {
         if (!isFirstBeat || bean.status === DOWN) {
             const notificationList = await Monitor.getNotificationList(monitor);
@@ -755,6 +944,11 @@ class Monitor extends BeanModel {
         }
     }
 
+    /**
+     * Get list of notification providers for a given monitor
+     * @param {Monitor} monitor Monitor to get notification providers for
+     * @returns {Promise<LooseObject<any>[]>}
+     */
     static async getNotificationList(monitor) {
         let notificationList = await R.getAll("SELECT notification.* FROM notification, monitor_notification WHERE monitor_id = ? AND monitor_notification.notification_id = notification.id ", [
             monitor.id,
@@ -762,17 +956,38 @@ class Monitor extends BeanModel {
         return notificationList;
     }
 
+    /**
+     * Send notification about a certificate
+     * @param {Object} tlsInfoObject Information about certificate
+     */
     async sendCertNotification(tlsInfoObject) {
         if (tlsInfoObject && tlsInfoObject.certInfo && tlsInfoObject.certInfo.daysRemaining) {
             const notificationList = await Monitor.getNotificationList(this);
 
-            log.debug("monitor", "call sendCertNotificationByTargetDays");
-            await this.sendCertNotificationByTargetDays(tlsInfoObject.certInfo.daysRemaining, 21, notificationList);
-            await this.sendCertNotificationByTargetDays(tlsInfoObject.certInfo.daysRemaining, 14, notificationList);
-            await this.sendCertNotificationByTargetDays(tlsInfoObject.certInfo.daysRemaining, 7, notificationList);
+            let notifyDays = await setting("tlsExpiryNotifyDays");
+            if (notifyDays == null || !Array.isArray(notifyDays)) {
+                // Reset Default
+                setSetting("tlsExpiryNotifyDays", [ 7, 14, 21 ], "general");
+                notifyDays = [ 7, 14, 21 ];
+            }
+
+            if (notifyDays != null && Array.isArray(notifyDays)) {
+                for (const day of notifyDays) {
+                    log.debug("monitor", "call sendCertNotificationByTargetDays", day);
+                    await this.sendCertNotificationByTargetDays(tlsInfoObject.certInfo.daysRemaining, day, notificationList);
+                }
+            }
         }
     }
 
+    /**
+     * Send a certificate notification when certificate expires in less
+     * than target days
+     * @param {number} daysRemaining Number of days remaining on certifcate
+     * @param {number} targetDays Number of days to alert after
+     * @param {LooseObject<any>[]} notificationList List of notification providers
+     * @returns {Promise<void>}
+     */
     async sendCertNotificationByTargetDays(daysRemaining, targetDays, notificationList) {
 
         if (daysRemaining > targetDays) {
@@ -820,6 +1035,11 @@ class Monitor extends BeanModel {
         }
     }
 
+    /**
+     * Get the status of the previous heartbeat
+     * @param {number} monitorID ID of monitor to check
+     * @returns {Promise<LooseObject<any>>}
+     */
     static async getPreviousHeartbeat(monitorID) {
         return await R.getRow(`
             SELECT status, time FROM heartbeat
