@@ -5,6 +5,12 @@
  */
 console.log("Welcome to Uptime Kuma");
 
+// As the log function need to use dayjs, it should be very top
+const dayjs = require("dayjs");
+dayjs.extend(require("dayjs/plugin/utc"));
+dayjs.extend(require("dayjs/plugin/timezone"));
+dayjs.extend(require("dayjs/plugin/customParseFormat"));
+
 // Check Node.js Version
 const nodeVersion = parseInt(process.versions.node.split(".")[0]);
 const requiredVersion = 14;
@@ -33,6 +39,7 @@ log.info("server", "Importing Node libraries");
 const fs = require("fs");
 
 log.info("server", "Importing 3rd-party libraries");
+
 log.debug("server", "Importing express");
 const express = require("express");
 const expressStaticGzip = require("express-static-gzip");
@@ -61,7 +68,7 @@ log.info("server", "Importing this project modules");
 log.debug("server", "Importing Monitor");
 const Monitor = require("./model/monitor");
 log.debug("server", "Importing Settings");
-const { getSettings, setSettings, setting, initJWTSecret, checkLogin, startUnitTest, FBSD, doubleCheckPassword } = require("./util-server");
+const { getSettings, setSettings, setting, initJWTSecret, checkLogin, startUnitTest, FBSD, doubleCheckPassword, startE2eTests } = require("./util-server");
 
 log.debug("server", "Importing Notification");
 const { Notification } = require("./notification");
@@ -112,6 +119,7 @@ const twoFAVerifyOptions = {
  * @type {boolean}
  */
 const testMode = !!args["test"] || false;
+const e2eTestMode = !!args["e2e"] || false;
 
 if (config.demoMode) {
     log.info("server", "==== Demo Mode ====");
@@ -126,6 +134,8 @@ const StatusPage = require("./model/status_page");
 const { cloudflaredSocketHandler, autoStart: cloudflaredAutoStart, stop: cloudflaredStop } = require("./socket-handlers/cloudflared-socket-handler");
 const { proxySocketHandler } = require("./socket-handlers/proxy-socket-handler");
 const { dockerSocketHandler } = require("./socket-handlers/docker-socket-handler");
+const { maintenanceSocketHandler } = require("./socket-handlers/maintenance-socket-handler");
+const { Settings } = require("./settings");
 
 app.use(express.json());
 
@@ -153,8 +163,9 @@ let needSetup = false;
 (async () => {
     Database.init(args);
     await initDatabase(testMode);
+    await server.initAfterDatabaseReady();
 
-    exports.entryPage = await setting("entryPage");
+    server.entryPage = await Settings.get("entryPage");
     await StatusPage.loadDomainMappingList();
 
     log.info("server", "Adding route");
@@ -175,14 +186,15 @@ let needSetup = false;
 
         log.debug("entry", `Request Domain: ${hostname}`);
 
+        const uptimeKumaEntryPage = server.entryPage;
         if (hostname in StatusPage.domainMappingList) {
             log.debug("entry", "This is a status page domain");
 
             let slug = StatusPage.domainMappingList[hostname];
             await StatusPage.handleStatusPageResponse(response, server.indexHTML, slug);
 
-        } else if (exports.entryPage && exports.entryPage.startsWith("statusPage-")) {
-            response.redirect("/status/" + exports.entryPage.replace("statusPage-", ""));
+        } else if (uptimeKumaEntryPage && uptimeKumaEntryPage.startsWith("statusPage-")) {
+            response.redirect("/status/" + uptimeKumaEntryPage.replace("statusPage-", ""));
 
         } else {
             response.redirect("/dashboard");
@@ -191,6 +203,7 @@ let needSetup = false;
 
     if (isDev) {
         app.post("/test-webhook", async (request, response) => {
+            log.debug("test", request.headers);
             log.debug("test", request.body);
             response.send("OK");
         });
@@ -199,7 +212,7 @@ let needSetup = false;
     // Robots.txt
     app.get("/robots.txt", async (_request, response) => {
         let txt = "User-agent: *\nDisallow:";
-        if (! await setting("searchEngineIndex")) {
+        if (!await setting("searchEngineIndex")) {
             txt += " /";
         }
         response.setHeader("Content-Type", "text/plain");
@@ -619,6 +632,9 @@ let needSetup = false;
 
                 bean.import(monitor);
                 bean.user_id = socket.userID;
+
+                bean.validate();
+
                 await R.store(bean);
 
                 await updateMonitorNotification(bean.id, notificationIDList);
@@ -694,11 +710,19 @@ let needSetup = false;
                 bean.authMethod = monitor.authMethod;
                 bean.authWorkstation = monitor.authWorkstation;
                 bean.authDomain = monitor.authDomain;
+                bean.grpcUrl = monitor.grpcUrl;
+                bean.grpcProtobuf = monitor.grpcProtobuf;
+                bean.grpcMethod = monitor.grpcMethod;
+                bean.grpcBody = monitor.grpcBody;
+                bean.grpcMetadata = monitor.grpcMetadata;
+                bean.grpcEnableTls = monitor.grpcEnableTls;
                 bean.radiusUsername = monitor.radiusUsername;
                 bean.radiusPassword = monitor.radiusPassword;
                 bean.radiusCalledStationId = monitor.radiusCalledStationId;
                 bean.radiusCallingStationId = monitor.radiusCallingStationId;
                 bean.radiusSecret = monitor.radiusSecret;
+
+                bean.validate();
 
                 await R.store(bean);
 
@@ -1054,10 +1078,15 @@ let needSetup = false;
         socket.on("getSettings", async (callback) => {
             try {
                 checkLogin(socket);
+                const data = await getSettings("general");
+
+                if (!data.serverTimezone) {
+                    data.serverTimezone = await server.getTimezone();
+                }
 
                 callback({
                     ok: true,
-                    data: await getSettings("general"),
+                    data: data,
                 });
 
             } catch (e) {
@@ -1083,7 +1112,12 @@ let needSetup = false;
                 }
 
                 await setSettings("general", data);
-                exports.entryPage = data.entryPage;
+                server.entryPage = data.entryPage;
+
+                // Also need to apply timezone globally
+                if (data.serverTimezone) {
+                    await server.setTimezone(data.serverTimezone);
+                }
 
                 callback({
                     ok: true,
@@ -1091,6 +1125,7 @@ let needSetup = false;
                 });
 
                 sendInfo(socket);
+                server.sendMaintenanceList(socket);
 
             } catch (e) {
                 callback({
@@ -1449,6 +1484,7 @@ let needSetup = false;
         databaseSocketHandler(socket);
         proxySocketHandler(socket);
         dockerSocketHandler(socket);
+        maintenanceSocketHandler(socket);
 
         log.debug("server", "added all socket handlers");
 
@@ -1485,6 +1521,10 @@ let needSetup = false;
 
         if (testMode) {
             startUnitTest();
+        }
+
+        if (e2eTestMode) {
+            startE2eTests();
         }
     });
 
@@ -1547,6 +1587,7 @@ async function afterLogin(socket, user) {
     socket.join(user.id);
 
     let monitorList = await server.sendMonitorList(socket);
+    server.sendMaintenanceList(socket);
     sendNotificationList(socket);
     sendProxyList(socket);
     sendDockerHostList(socket);
@@ -1692,6 +1733,8 @@ async function shutdownFunction(signal) {
     log.info("server", "Shutdown requested");
     log.info("server", "Called signal: " + signal);
 
+    await server.stop();
+
     log.info("server", "Stopping all monitors");
     for (let id in server.monitorList) {
         let monitor = server.monitorList[id];
@@ -1702,6 +1745,7 @@ async function shutdownFunction(signal) {
 
     stopBackgroundJobs();
     await cloudflaredStop();
+    Settings.stopCacheCleaner();
 }
 
 /** Final function called before application exits */
